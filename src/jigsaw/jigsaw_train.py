@@ -12,18 +12,20 @@ import signal
 import time
 
 import torch
-
+import apex.amp as amp
 import distributed
-from models import data_loader, model_builder
-from models.data_loader import load_dataset
-from models.model_builder import ExtSummarizer  # 这是模型 22:49 3/21
-from models.trainer_ext import build_trainer  # 这是trainer 是特殊的并没用原来的trainer
+from jigsaw import jigsaw_data_loader
+from jigsaw.jigsaw_model import Jigsaw
+from jigsaw.jigsaw_trainer import build_trainer  # 这是trainer 是特殊的并没用原来的trainer
 from others.logging import logger, init_logger
-
+from models.model_builder import build_optim
+from models.sentence_transformer import SentenceTransformer
+# from torch.nn.parallel import DistributedDataParallel
+from apex.parallel import DistributedDataParallel
 model_flags = ['hidden_size', 'ff_size', 'heads', 'inter_layers', 'encoder', 'ff_actv', 'use_interval', 'rnn_size']
 
 
-def train_multi_ext(args):
+def train_multi_jigsaw(args):
     """ Spawns 1 process per GPU """
     init_logger()
 
@@ -58,7 +60,7 @@ def run(args, device_id, error_queue):
             raise AssertionError("An error occurred in \
                   Distributed initialization")
 
-        train_single_ext(args, device_id)
+        train_single_jigsaw(args, device_id)
     except KeyboardInterrupt:
         pass  # killed by parent, do nothing
     except Exception:
@@ -103,7 +105,7 @@ class ErrorHandler(object):
         raise Exception(msg)
 
 
-def validate_ext(args, device_id):
+def validate_jigsaw(args, device_id):
     timestep = 0
     if (args.test_all):
         cp_files = sorted(glob.glob(os.path.join(args.model_path, 'model_step_*.pt')))
@@ -120,7 +122,7 @@ def validate_ext(args, device_id):
         logger.info('PPL %s' % str(xent_lst))
         for xent, cp in xent_lst:
             step = int(cp.split('.')[-2].split('_')[-1])
-            test_ext(args, device_id, cp, step)
+            test_jigsaw(args, device_id, cp, step)
     else:
         while (True):
             cp_files = sorted(glob.glob(os.path.join(args.model_path, 'model_step_*.pt')))
@@ -135,7 +137,7 @@ def validate_ext(args, device_id):
                     timestep = time_of_cp
                     step = int(cp.split('.')[-2].split('_')[-1])
                     validate(args, device_id, cp, step)
-                    test_ext(args, device_id, cp, step)
+                    test_jigsaw(args, device_id, cp, step)
 
             cp_files = sorted(glob.glob(os.path.join(args.model_path, 'model_step_*.pt')))
             cp_files.sort(key=os.path.getmtime)
@@ -161,19 +163,21 @@ def validate(args, device_id, pt, step):
         if (k in model_flags):
             setattr(args, k, opt[k])
     print(args)
-
-    model = ExtSummarizer(args, device, checkpoint)
+    jigsaw = args.jigsaw if 'jigsaw' in args else 'jigsaw_lab'
+    if jigsaw == 'jigsaw_dec':
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=1)
+    else:
+        model = Jigsaw(args, device, checkpoint)
     model.eval()
 
-    valid_iter = data_loader.Dataloader(args, load_dataset(args, 'valid', shuffle=False),
-                                        args.batch_size, device,
-                                        shuffle=False, is_test=False)
+    valid_iter = jigsaw_data_loader.Dataloader(args, jigsaw_data_loader.load_dataset(args, 'valid', shuffle=False),
+                                               args.batch_size, device, shuffle=False, is_test=False)
     trainer = build_trainer(args, device_id, model, None)
     stats = trainer.validate(valid_iter, step)
     return stats.xent()
 
 
-def test_ext(args, device_id, pt, step):
+def test_jigsaw(args, device_id, pt, step):
     device = "cpu" if args.visible_gpus == '-1' else "cuda"
     if (pt != ''):
         test_from = pt
@@ -186,24 +190,28 @@ def test_ext(args, device_id, pt, step):
         if (k in model_flags):
             setattr(args, k, opt[k])
     print(args)
-
-    model = ExtSummarizer(args, device, checkpoint)
+    jigsaw = args.jigsaw if 'jigsaw' in args else 'jigsaw_lab'
+    if jigsaw == 'jigsaw_dec':
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=1)
+    else:
+        model = Jigsaw(args, device, checkpoint)
     model.eval()
 
-    test_iter = data_loader.Dataloader(args, load_dataset(args, 'test', shuffle=False),
+    test_iter = jigsaw_data_loader.Dataloader(args, jigsaw_data_loader.load_dataset(args, 'test', shuffle=False),
                                        args.test_batch_size, device,
                                        shuffle=False, is_test=True)
     trainer = build_trainer(args, device_id, model, None)
     trainer.test(test_iter, step)
 
-def train_ext(args, device_id):
+
+def train_jigsaw(args, device_id):
     if (args.world_size > 1):
-        train_multi_ext(args)
+        train_multi_jigsaw(args)
     else:
-        train_single_ext(args, device_id)
+        train_single_jigsaw(args, device_id)
 
 
-def train_single_ext(args, device_id):
+def train_single_jigsaw(args, device_id):
     init_logger(args.log_file)
 
     device = "cpu" if args.visible_gpus == '-1' else "cuda"
@@ -233,13 +241,21 @@ def train_single_ext(args, device_id):
         checkpoint = None
 
     def train_iter_fct():
-        return data_loader.Dataloader(args, load_dataset(args, 'train', shuffle=True), args.batch_size, device,
+        return jigsaw_data_loader.Dataloader(args, jigsaw_data_loader.load_dataset(args, 'train', shuffle=True), args.batch_size, device,
                                       shuffle=True, is_test=False)
-
-    model = ExtSummarizer(args, device, checkpoint)
-    optim = model_builder.build_optim(args, model, checkpoint)
+    jigsaw = args.jigsaw if 'jigsaw' in args else 'jigsaw_lab'
+    if jigsaw == 'jigsaw_dec':
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=1)
+    else:
+        model = Jigsaw(args, device, checkpoint)
+    optim = build_optim(args, model, checkpoint)
 
     logger.info(model)
-
+    if args.fp16:
+        opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
+    else:
+        opt_level = 'O0'  # pure fp32 traning
+    model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
+    # logger.info('type(optim)'+str(type(optim)))
     trainer = build_trainer(args, device_id, model, optim)
     trainer.train(train_iter_fct, args.train_steps)

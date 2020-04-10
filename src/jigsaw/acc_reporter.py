@@ -142,6 +142,7 @@ class ReportMgr(ReportMgrBase):
         """
         if train_stats is not None:
             self.log('Train xent: %g' % train_stats.xent())
+            self.log('Train acc: %g' % train_stats.acc())
 
             self.maybe_log_tensorboard(train_stats,
                                        "train",
@@ -150,7 +151,7 @@ class ReportMgr(ReportMgrBase):
 
         if valid_stats is not None:
             self.log('Validation xent: %g at step %d' % (valid_stats.xent(), step))
-
+            self.log('Validation acc: %g at step %d' % (valid_stats.acc(), step))
             self.maybe_log_tensorboard(valid_stats,
                                        "valid",
                                        lr,
@@ -167,8 +168,9 @@ class Statistics(object):
     * elapsed time
     """
 
-    def __init__(self, loss=0, n_docs=0, n_correct=0):
+    def __init__(self, loss=0,accuracy=0, n_docs=0, n_correct=0):
         self.loss = loss
+        self.accuracy = accuracy
         self.n_docs = n_docs
         self.start_time = time.time()
 
@@ -227,6 +229,7 @@ class Statistics(object):
 
         """
         self.loss += stat.loss
+        self.accuracy += stat.accuracy
         self.n_docs += stat.n_docs
 
     def xent(self):
@@ -234,6 +237,13 @@ class Statistics(object):
         if (self.n_docs == 0):
             return 0
         return self.loss / self.n_docs
+
+    def acc(self):
+        """ compute cross entropy """
+        if (self.n_docs == 0):
+            return 0
+        return self.accuracy / self.n_docs * 100
+
 
     def elapsed_time(self):
         """ compute elapsed time """
@@ -252,10 +262,10 @@ class Statistics(object):
         if num_steps > 0:
             step_fmt = "%s/%5d" % (step_fmt, num_steps)
         logger.info(
-            ("Step %s; xent: %4.2f; " +
-             "lr: %7.7f; %3.0f docs/s; %6.0f sec")
+            ("Step %s; xent: %4.2f; accuracy: %3.4f%%; lr: %7.7f; %3.0f docs/s; %6.0f sec")
             % (step_fmt,
                self.xent(),
+               self.acc(),
                learning_rate,
                self.n_docs / (t + 1e-5),
                time.time() - start))
@@ -265,4 +275,5 @@ class Statistics(object):
         """ display statistics to tensorboard """
         t = self.elapsed_time()
         writer.add_scalar(prefix + "/xent", self.xent(), step)
+        writer.add_scalar(prefix + "/acc", self.acc(), step)
         writer.add_scalar(prefix + "/lr", learning_rate, step)

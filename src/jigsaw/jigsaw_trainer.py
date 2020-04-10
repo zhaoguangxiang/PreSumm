@@ -9,7 +9,7 @@ import distributed
 from models.reporter_ext import ReportMgr, Statistics
 from others.logging import logger
 from others.utils import test_rouge, rouge_results_to_str
-
+import apex.amp as amp
 
 def _tally_parameters(model):
     n_params = sum([p.nelement() for p in model.parameters()])
@@ -243,7 +243,7 @@ class Trainer(object):
                     if (self.optim._step + 1) % self.args.print_every == 0:
                         logger.info(
                             'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
-                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.final_dec_labels) * batch.mask_cls_s),
                                          torch.sum(batch.mask_cls_s)) * len(logits)
 
 
@@ -380,58 +380,61 @@ class Trainer(object):
             # setattr(self, 'org_sent_labels' + postfix, org_sent_labels.to(device))
             # poss = torch.tensor(self._pad(poss, -1))
             # setattr(self, 'poss' + postfix, poss.to(device))
-            if self.args.jigsaw == 'jigsaw_lab':  # jigsaw_lab 各自预测的那种,失败的尝试
-                logits = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s)# bsz tgt_len nsent
-                # bsz, sent, max-sent_num
-                # mask = batch.mask_cls_s[:, :, None].float()
-                # loss = self.loss(sent_scores, batch.poss_s.float())
-                loss = F.nll_loss(
-                    F.log_softmax(
-                        logits.view(-1, logits.size(-1)),
-                        dim=-1,
-                        dtype=torch.float32,
-                    ),
-                    batch.poss_s.view(-1), # bsz sent
-                    reduction='sum',
-                    ignore_index=-1,
-                )
-                prediction = torch.argmax(logits, dim=-1)
-                if (self.optim._step + 1) % self.args.print_every == 0:
-                    logger.info(
-                        'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
-                accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
-                                     torch.sum(batch.mask_cls_s)) * len(logits)
+            with torch.cuda.amp.autocast():
+                if self.args.jigsaw == 'jigsaw_lab':  # jigsaw_lab 各自预测的那种,失败的尝试
+                    logits = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s)# bsz tgt_len nsent
+                    # bsz, sent, max-sent_num
+                    # mask = batch.mask_cls_s[:, :, None].float()
+                    # loss = self.loss(sent_scores, batch.poss_s.float())
+                    loss = F.nll_loss(
+                        F.log_softmax(
+                            logits.view(-1, logits.size(-1)),
+                            dim=-1,
+                            dtype=torch.float32,
+                        ),
+                        batch.poss_s.view(-1), # bsz sent
+                        reduction='sum',
+                        ignore_index=-1,
+                    )
+                    prediction = torch.argmax(logits, dim=-1)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                                         torch.sum(batch.mask_cls_s)) * len(logits)
 
-                # loss = (loss * batch.mask_cls_s.float()).sum()
-                # print('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
-                # logger.info('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
-                (loss / loss.numel()).backward()
-            else:  #self.args.jigsaw == 'jigsaw_dec':    jigsaw decoder
-                poss_s = batch.poss_s
-                mask_poss = torch.eq(poss_s, -1)
-                poss_s.masked_fill_(mask_poss, 1e4)
-                # poss_s[i] [5,1,4,0,2,3,-1,-1]->[5,1,4,0,2,3,1e4,1e4] dec_labels[i] [3,1,xxx,6,7]
-                dec_labels = torch.argsort(poss_s, dim=1)
-                logits,_ = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s, dec_labels)
-                final_dec_labels = dec_labels.masked_fill(mask_poss, -1)
-                loss = F.nll_loss(
-                    F.log_softmax(
-                        logits.view(-1, logits.size(-1)),
-                        dim=-1,
-                        dtype=torch.float32,
-                    ),
-                    final_dec_labels.view(-1),  # bsz sent
-                    reduction='sum',
-                    ignore_index=-1,
-                )
-                # loss = (loss * batch.mask_cls_s.float()).sum()
-                (loss / loss.numel()).backward()
-                prediction = torch.argmax(logits, dim=-1)
-                if (self.optim._step + 1) % self.args.print_every == 0:
-                    logger.info(
-                        'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
-                accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
-                                     torch.sum(batch.mask_cls_s)) * len(logits)
+                    # loss = (loss * batch.mask_cls_s.float()).sum()
+                    # print('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
+                    # logger.info('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
+                    # (loss / loss.numel()).backward()
+                else:  #self.args.jigsaw == 'jigsaw_dec':    jigsaw decoder
+                    poss_s = batch.poss_s
+                    mask_poss = torch.eq(poss_s, -1)
+                    poss_s.masked_fill_(mask_poss, 1e4)
+                    # poss_s[i] [5,1,4,0,2,3,-1,-1]->[5,1,4,0,2,3,1e4,1e4] dec_labels[i] [3,1,xxx,6,7]
+                    dec_labels = torch.argsort(poss_s, dim=1)
+                    logits,_ = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s, dec_labels)
+                    final_dec_labels = dec_labels.masked_fill(mask_poss, -1)
+                    loss = F.nll_loss(
+                        F.log_softmax(
+                            logits.view(-1, logits.size(-1)),
+                            dim=-1,
+                            dtype=torch.float32,
+                        ),
+                        final_dec_labels.view(-1),  # bsz sent
+                        reduction='sum',
+                        ignore_index=-1,
+                    )
+                    # loss = (loss * batch.mask_cls_s.float()).sum()
+                    # (loss / loss.numel()).backward()
+                    prediction = torch.argmax(logits, dim=-1)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                                         torch.sum(batch.mask_cls_s)) * len(logits)
+            with amp.scale_loss((loss / loss.numel()), self.optim) as scaled_loss:
+                scaled_loss.backward()
             # loss.div(float(normalization)).backward()
             if self.args.acc_reporter:
                 batch_stats = acc_reporter.Statistics(float(loss.cpu().data.numpy()), accuracy, normalization)

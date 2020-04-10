@@ -16,11 +16,13 @@ import torch
 import distributed
 from models import data_loader, model_builder
 from models.data_loader import load_dataset
-from models.model_builder import ExtSummarizer
-from models.trainer_ext import build_trainer
+from models.model_builder import ExtSummarizer  # 这是模型 22:49 3/21
+from models.trainer_ext import build_trainer  # 这是trainer 是特殊的并没用原来的trainer
 from others.logging import logger, init_logger
-
+from models.sentence_transformer import SentenceTransformer  # 23:03 3/31
 model_flags = ['hidden_size', 'ff_size', 'heads', 'inter_layers', 'encoder', 'ff_actv', 'use_interval', 'rnn_size']
+import apex.amp as amp
+from torch.nn.parallel import DistributedDataParallel
 
 
 def train_multi_ext(args):
@@ -161,8 +163,10 @@ def validate(args, device_id, pt, step):
         if (k in model_flags):
             setattr(args, k, opt[k])
     print(args)
-
-    model = ExtSummarizer(args, device, checkpoint)
+    if args.ext_sum_dec:
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=0)
+    else:
+        model = ExtSummarizer(args, device, checkpoint)
     model.eval()
 
     valid_iter = data_loader.Dataloader(args, load_dataset(args, 'valid', shuffle=False),
@@ -186,8 +190,10 @@ def test_ext(args, device_id, pt, step):
         if (k in model_flags):
             setattr(args, k, opt[k])
     print(args)
-
-    model = ExtSummarizer(args, device, checkpoint)
+    if args.ext_sum_dec:
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=0)
+    else:
+        model = ExtSummarizer(args, device, checkpoint)
     model.eval()
 
     test_iter = data_loader.Dataloader(args, load_dataset(args, 'test', shuffle=False),
@@ -235,11 +241,17 @@ def train_single_ext(args, device_id):
     def train_iter_fct():
         return data_loader.Dataloader(args, load_dataset(args, 'train', shuffle=True), args.batch_size, device,
                                       shuffle=True, is_test=False)
-
-    model = ExtSummarizer(args, device, checkpoint)
+    if args.ext_sum_dec:
+        model = SentenceTransformer(args, device, checkpoint, sum_or_jigsaw=0)
+    else:
+        model = ExtSummarizer(args, device, checkpoint)
     optim = model_builder.build_optim(args, model, checkpoint)
 
     logger.info(model)
-
+    if args.fp16:
+        opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
+    else:
+        opt_level = 'O0'  # pure fp32 traning
+    model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
     trainer = build_trainer(args, device_id, model, optim)
     trainer.train(train_iter_fct, args.train_steps)

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter
 from fairseq import utils
 from fairseq.models import (
-    FairseqEncoder,
+    # FairseqEncoder,
     FairseqIncrementalDecoder
 )
 
@@ -121,19 +121,13 @@ class TransformerDecoderLayer(nn.Module):
                 self.embed_dim, args.decoder_attention_heads, args=args,
                 dropout=args.attention_dropout,
             )
-        self.ffn_dim = args.encoder_ffn_embed_dim
-        # self.bm_fc3 = args.bm_fc3 if 'bm_fc3' in args else 0
-        # self.bm_fc4 = args.bm_fc4 if 'bm_fc4' in args else 0
-        # combine dynamic conv into self attn
-        self.attn_dynamic_kernel = args.kernel_size if 'kernel_size' in args else 0
-        self.fc1 = Linear(args, self.embed_dim, 3 * self.embed_dim)  # decoder self qkv linear
-        self.fc3 = Linear(args, self.embed_dim, self.embed_dim)  # decoder context q linear
-        self.fc2 = Linear(args, self.embed_dim , self.embed_dim)  #
-        self.fc4 = Linear(args, self.embed_dim, self.embed_dim)
-
+        self.fc1 = Linear(self.embed_dim, 3 * self.embed_dim)  # decoder self qkv linear
+        self.fc3 = Linear(self.embed_dim, self.embed_dim)  # decoder context q linear
+        self.fc2 = Linear(self.embed_dim , self.embed_dim)  #
+        self.fc4 = Linear(self.embed_dim, self.embed_dim)
         self.need_attn = True
         self.onnx_trace = False
-        ffn_dim = args.encoder_ffn_embed_dim
+        ffn_dim = args.decoder_ffn_embed_dim
         self.ffn = nn.Sequential(Linear(self.embed_dim, ffn_dim), nn.ReLU(), Linear(ffn_dim, self.embed_dim))
 
     def prepare_for_onnx_export_(self):
@@ -528,7 +522,7 @@ class MultiheadAttentionContext(nn.Module):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
         self.scaling = self.head_dim ** -0.5
-        self.kv_fc = Linear(args, embed_dim, 2*embed_dim)
+        self.kv_fc = Linear(embed_dim, 2*embed_dim)
         self.onnx_trace = False
 
     def prepare_for_onnx_export_(self):
@@ -675,19 +669,9 @@ class MultiheadAttentionContext(nn.Module):
         )
 
 
-class TransformerEncoder(FairseqEncoder):
-    """
-    Transformer encoder consisting of *args.encoder_layers* layers. Each layer
-    is a :class:`TransformerEncoderLayer`.
-
-    Args:
-        args (argparse.Namespace): parsed command-line arguments
-        dictionary (~fairseq.data.Dictionary): encoding dictionary
-        embed_tokens (torch.nn.Embedding): input embedding
-    """
-
+class TransformerEncoder(nn.Module):
     def __init__(self, args, dictionary, embed_tokens):
-        super().__init__(dictionary)
+        super(TransformerEncoder, self).__init__()
         self.dropout = args.dropout
 
         embed_dim = embed_tokens.embedding_dim
@@ -709,7 +693,7 @@ class TransformerEncoder(FairseqEncoder):
         self.register_buffer('version', torch.Tensor([2]))
         self.normalize = args.encoder_normalize_before
         if self.normalize:
-            self.layer_norm = LayerNorm(embed_dim, args=args)
+            self.layer_norm = LayerNorm(embed_dim)
 
     def forward(self, src_tokens, src_lengths):
         """
@@ -861,7 +845,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.register_buffer('version', torch.Tensor([2]))
         self.normalize = args.decoder_normalize_before and final_norm
         if self.normalize:
-            self.layer_norm = LayerNorm(embed_dim, args=args)
+            self.layer_norm = LayerNorm(embed_dim)
 
     def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None, **unused):
         """
@@ -965,35 +949,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             self._future_mask = torch.triu(utils.fill_with_neg_inf(self._future_mask.resize_(dim, dim)), 1)
         return self._future_mask[:dim, :dim]
 
-    def upgrade_state_dict_named(self, state_dict, name):
-        """Upgrade a (possibly old) state dict for new versions of fairseq."""
-        if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
-            weights_key = '{}.embed_positions.weights'.format(name)
-            if weights_key in state_dict:
-                del state_dict[weights_key]
-            state_dict['{}.embed_positions._float_tensor'.format(name)] = torch.FloatTensor(1)
-
-        for i in range(len(self.layers)):
-            # update layer norms
-            layer_norm_map = {
-                '0': 'self_attn_layer_norm',
-                '1': 'encoder_attn_layer_norm',
-                '2': 'final_layer_norm'
-            }
-            for old, new in layer_norm_map.items():
-                for m in ('weight', 'bias'):
-                    k = '{}.layers.{}.layer_norms.{}.{}'.format(name, i, old, m)
-                    if k in state_dict:
-                        state_dict['{}.layers.{}.{}.{}'.format(name, i, new, m)] = state_dict[k]
-                        del state_dict[k]
-        if utils.item(state_dict.get('{}.version'.format(name), torch.Tensor([1]))[0]) < 2:
-            # earlier checkpoints did not normalize after the stack of layers
-            self.layer_norm = None
-            self.normalize = False
-            state_dict['{}.version'.format(name)] = torch.Tensor([1])
-
-        return state_dict
-
 
 def Linear(in_features, out_features, bias=True):
     m = nn.Linear(in_features, out_features, bias)
@@ -1003,27 +958,27 @@ def Linear(in_features, out_features, bias=True):
     return m
 
 
-try:
-    from apex.normalization import FusedLayerNorm as _FusedLayerNorm
+# try:
+#     from apex.normalization import FusedLayerNorm as _FusedLayerNorm
+#
+#     has_fused_layernorm = True
+#
+#     class FusedLayerNorm(_FusedLayerNorm):
+#         @torch.jit.unused
+#         def forward(self, x):
+#             if not x.is_cuda:
+#                 return super().forward(x)
+#             else:
+#                 with torch.cuda.device(x.device):
+#                     return super().forward(x)
 
-    has_fused_layernorm = True
-
-    class FusedLayerNorm(_FusedLayerNorm):
-        @torch.jit.unused
-        def forward(self, x):
-            if not x.is_cuda:
-                return super().forward(x)
-            else:
-                with torch.cuda.device(x.device):
-                    return super().forward(x)
-
-except ImportError:
-    has_fused_layernorm = False
+# except ImportError:
+#     has_fused_layernorm = False
 
 
 def LayerNorm(normalized_shape, eps=1e-5, elementwise_affine=True, export=False):
-    if not export and torch.cuda.is_available() and has_fused_layernorm:
-        return FusedLayerNorm(normalized_shape, eps, elementwise_affine)
+    # if not export and torch.cuda.is_available() and has_fused_layernorm:
+    #     return FusedLayerNorm(normalized_shape, eps, elementwise_affine)
     return torch.nn.LayerNorm(normalized_shape, eps, elementwise_affine)
 
 

@@ -2,7 +2,7 @@ import copy
 
 import torch
 import torch.nn as nn
-from pytorch_transformers import BertModel, BertConfig
+from transformers import BertModel, BertConfig
 from torch.nn.init import xavier_uniform_
 
 from models.decoder import TransformerDecoder
@@ -12,8 +12,8 @@ from models.optimizers import Optimizer
 def build_optim(args, model, checkpoint):
     """ Build optimizer """
 
-    if checkpoint is not None:
-        optim = checkpoint['optim'][0]
+    if checkpoint is not None and not args.reset_optim:
+        optim = checkpoint['optim']
         saved_optimizer_state_dict = optim.optimizer.state_dict()
         optim.optimizer.load_state_dict(saved_optimizer_state_dict)
         if args.visible_gpus != '-1':
@@ -124,11 +124,11 @@ class Bert(nn.Module):
 
     def forward(self, x, segs, mask):
         if(self.finetune):
-            top_vec, _ = self.model(x, segs, attention_mask=mask)
+            top_vec, _ = self.model(input_ids=x, token_type_ids=segs, attention_mask=mask)
         else:
             self.eval()
             with torch.no_grad():
-                top_vec, _ = self.model(x, segs, attention_mask=mask)
+                top_vec, _ = self.model(input_ids=x, token_type_ids=segs, attention_mask=mask)
         return top_vec
 
 

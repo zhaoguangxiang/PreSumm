@@ -9,7 +9,7 @@ import os
 from others.logging import init_logger
 from train_abstractive import validate_abs, train_abs, baseline, test_abs, test_text_abs
 from train_extractive import train_ext, validate_ext, test_ext
-
+from jigsaw.jigsaw_train import train_jigsaw, validate_jigsaw, test_jigsaw
 model_flags = ['hidden_size', 'ff_size', 'heads', 'emb_size', 'enc_layers', 'enc_hidden_size', 'enc_ff_size',
                'dec_layers', 'dec_hidden_size', 'dec_ff_size', 'encoder', 'ff_actv', 'use_interval']
 
@@ -23,11 +23,9 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
+    parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs', 'jigsaw'])
     parser.add_argument("-encoder", default='bert', type=str, choices=['bert', 'baseline'])
     parser.add_argument("-mode", default='train', type=str, choices=['train', 'validate', 'test'])
     parser.add_argument("-bert_data_path", default='../bert_data_new/cnndm')
@@ -75,6 +73,52 @@ if __name__ == '__main__':
     parser.add_argument("-max_length", default=150, type=int)
     parser.add_argument("-max_tgt_len", default=140, type=int)
 
+    # params for jigsaw
+    # max_pos 我是按句子来的，这个可能也超512了， 感觉还是hibert 句内pos emb 靠谱
+    parser.add_argument("-jigsaw", default= 'jigsaw_dec', type=str,choices=['jigsaw_lab', 'jigsaw_dec'])
+    parser.add_argument("-keep_orgdata", default=0, type=int)  # be consitent with preprocess
+    parser.add_argument('-max_src_nsents', default=20, type=int)  # be consitent with preprocess
+    parser.add_argument("-sent_pos_emb", default=0, type=int,help='for org seq lab jigsaw')  # used in encoder/jigsaw transformer encoder
+    parser.add_argument("-safe_max_pos", default=1024, type=int)
+
+    # for the org jigsaw model
+    parser.add_argument('-jigsaw_basic_encoder_layers', default=0, type=int, help='share for downstream tasks')
+    parser.add_argument('-jigsaw_high_encoder_layers', default=0, type=int,
+                        help='')
+    parser.add_argument("-jigsaw_dropout", default=0.2, type=float)
+    parser.add_argument("-jigsaw_hidden_size", default=768, type=int)
+    parser.add_argument("-jigsaw_heads", default=8, type=int)
+    parser.add_argument("-jigsaw_ff_size", default=2048, type=int)
+    parser.add_argument("-output_fc_type", default='linear', type=str, choices=['linear', 'nonlinear'])
+
+    # for jigsaw transformer
+    parser.add_argument("-sent_pos_emb_enc", default=0, type=int,help='0 for jisaw 1 for sum')
+    parser.add_argument("-dropout", default=0.2, type=float)
+    parser.add_argument("-attention_dropout", default=0.0, type=float)
+    parser.add_argument("-encoder_embed_dim", default=768, type=int)
+    parser.add_argument("-encoder_attention_heads", default=8, type=int)
+    parser.add_argument("-encoder_normalize_before", default=0, type=int)
+    parser.add_argument("-encoder_ffn_embed_dim", default=2048, type=int)
+    parser.add_argument("-decoder_embed_dim", default=768, type=int)
+    parser.add_argument("-decoder_attention_heads", default=8, type=int)
+    parser.add_argument("-decoder_normalize_before", default=0, type=int)
+    parser.add_argument("-decoder_ffn_embed_dim", default=2048, type=int)
+    parser.add_argument("-no_token_positional_embeddings", default=0, type=int)
+    parser.add_argument("-encoder_layers", default=2, type=int)
+    parser.add_argument("-decoder_layers", default=2, type=int)
+    parser.add_argument("-max_target_positions", default=20, type=int)
+    parser.add_argument("-decoder_learned_pos", default=1, type=int)
+    parser.add_argument("-bos_fc", default=1, type=int)
+    parser.add_argument("-doc_symbol", default=0, type=int)
+    parser.add_argument("-output_fc", default=1, type=int)
+    parser.add_argument("-qr", default='none', type=str,
+                        choices=['before_nosoftmax', 'before_softmax','none','after_softmax'])
+
+    parser.add_argument("-ext_sum_dec", default=0, type=int)
+
+    parser.add_argument("-fp16", default=0, type=int)
+
+
 
 
     parser.add_argument("-param_init", default=0, type=float)
@@ -108,9 +152,18 @@ if __name__ == '__main__':
     parser.add_argument("-report_rouge", type=str2bool, nargs='?',const=True,default=True)
     parser.add_argument("-block_trigram", type=str2bool, nargs='?', const=True, default=True)
 
+    parser.add_argument("-print_every", default=0, type=int)
+    parser.add_argument('-weight_up', type=float, default=1)
+
+    parser.add_argument("-reset_optim", default=0, type=int)
+    parser.add_argument("-acc_reporter", default=0, type=int)
+    parser.add_argument('-shuffle_ratio', type=float, default=1.0)
+
     args = parser.parse_args()
     args.gpu_ranks = [int(i) for i in range(len(args.visible_gpus.split(',')))]
     args.world_size = len(args.gpu_ranks)
+    # args.gpu_ranks = [3,4]
+    # args.world_size = 2
     os.environ["CUDA_VISIBLE_DEVICES"] = args.visible_gpus
 
     init_logger(args.log_file)
@@ -160,3 +213,15 @@ if __name__ == '__main__':
             except:
                 step = 0
                 test_text_abs(args, device_id, cp, step)
+    elif args.task == 'jigsaw':
+        if args.mode == 'train':
+            train_jigsaw(args, device_id)
+        elif args.mode == 'validate':
+            validate_jigsaw(args, device_id)
+        elif args.mode == 'test':
+            cp = args.test_from
+            try:
+                step = int(cp.split('.')[-2].split('_')[-1])
+            except:
+                step = 0
+            test_jigsaw(args, device_id, cp, step)

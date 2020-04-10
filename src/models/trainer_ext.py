@@ -6,8 +6,13 @@ from tensorboardX import SummaryWriter
 
 import distributed
 from models.reporter_ext import ReportMgr, Statistics
+from jigsaw import acc_reporter
 from others.logging import logger
 from others.utils import test_rouge, rouge_results_to_str
+from torch.nn import functional as F
+import apex.amp as amp
+
+
 
 
 def _tally_parameters(model):
@@ -43,8 +48,10 @@ def build_trainer(args, device_id, model, optim):
     tensorboard_log_dir = args.model_path
 
     writer = SummaryWriter(tensorboard_log_dir, comment="Unmt")
-
-    report_manager = ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
+    if args.acc_reporter == 1:
+        report_manager = acc_reporter.ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
+    else:
+        report_manager = ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
 
     trainer = Trainer(args, model, optim, grad_accum_count, n_gpu, gpu_rank, report_manager)
 
@@ -126,9 +133,12 @@ class Trainer(object):
         accum = 0
         normalization = 0
         train_iter = train_iter_fct()
-
-        total_stats = Statistics()
-        report_stats = Statistics()
+        if self.args.acc_reporter == 1:
+            total_stats = acc_reporter.Statistics()
+            report_stats = acc_reporter.Statistics()
+        else:
+            total_stats = Statistics()
+            report_stats = Statistics()
         self._start_report_manager(start_time=total_stats.start_time)
 
         while step <= train_steps:
@@ -140,7 +150,7 @@ class Trainer(object):
                     true_batchs.append(batch)
                     normalization += batch.batch_size
                     accum += 1
-                    if accum == self.grad_accum_count:
+                    if accum == self.grad_accum_count:  # 20200318 1703 似乎step就是num_updates
                         reduce_counter += 1
                         if self.n_gpu > 1:
                             normalization = sum(distributed
@@ -177,7 +187,10 @@ class Trainer(object):
         """
         # Set model in validating mode.
         self.model.eval()
-        stats = Statistics()
+        if self.args.acc_reporter == 1:
+            stats = acc_reporter.Statistics()
+        else:
+            stats = Statistics()
 
         with torch.no_grad():
             for batch in valid_iter:
@@ -188,11 +201,50 @@ class Trainer(object):
                 mask = batch.mask_src
                 mask_cls = batch.mask_cls
 
-                sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
-
-                loss = self.loss(sent_scores, labels.float())
-                loss = (loss * mask.float()).sum()
-                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                if self.args.ext_sum_dec:
+                    sent_scores, mask = self.model(src, segs, clss, mask, mask_cls, labels)  # B, tgt_len custom_num
+                    tgt_len = 3
+                    _, labels_id = torch.topk(labels, k=tgt_len)  # B, tgt_len
+                    labels_id, _ = torch.sort(labels_id)
+                    # nsent 100 weight_up 20
+                    weight = torch.linspace(start=1, end=self.args.weight_up, steps=self.args.max_src_nsents).type_as(sent_scores)
+                    # self.max_class = max(self.max_class,torch.max(labels_id+1).item())
+                    # weight = weight[:self.max_class]
+                    weight = weight[:sent_scores.size(-1)]
+                    # weight = torch.ones(self.args.max_src_nsents)
+                    loss = F.nll_loss(
+                        F.log_softmax(
+                            sent_scores.view(-1, sent_scores.size(-1)),
+                            dim=-1,
+                            dtype=torch.float32,
+                        ),
+                        labels_id.view(-1),  # bsz sent
+                        weight=weight,
+                        reduction='sum',
+                        ignore_index=-1,
+                    )
+                    prediction = torch.argmax(sent_scores, dim=-1)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(labels_id)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, labels_id).float()), tgt_len)
+                else:
+                    sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)  # B, custom_N
+                    loss = self.loss(sent_scores, labels.float())
+                    loss = (loss * mask.float()).sum()
+                    tgt_len = 3
+                    _, labels_id = torch.topk(labels, k=tgt_len)  # B, tgt_len
+                    labels_id, _ = torch.sort(labels_id)
+                    _, prediction = torch.topk(sent_scores, k=tgt_len)
+                    prediction,_ = torch.sort(labels_id)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(labels_id)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, labels_id).float()), tgt_len)
+                if self.args.acc_reporter == 1:
+                    batch_stats = Statistics(float(loss.cpu().data.numpy()),accuracy, len(labels))
+                else:
+                    batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
                 stats.update(batch_stats)
             self._report_step(0, step, valid_stats=stats)
             return stats
@@ -309,14 +361,56 @@ class Trainer(object):
             mask = batch.mask_src
             mask_cls = batch.mask_cls
 
-            sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
-
-            loss = self.loss(sent_scores, labels.float())
-            loss = (loss * mask.float()).sum()
-            (loss / loss.numel()).backward()
+            if self.args.ext_sum_dec:
+                sent_scores, mask = self.model(src, segs, clss, mask, mask_cls, labels)
+                tgt_len = 3
+                _, labels_id = torch.topk(labels, k=tgt_len)  # B, tgt_len
+                labels_id, _= torch.sort(labels_id)
+                # nsent 100 weight_up 20
+                weight = torch.linspace(start=1, end=self.args.weight_up, steps=self.args.max_src_nsents).type_as(
+                    sent_scores)
+                # global max_class
+                # max_class = max(max_class, torch.max(labels_id + 1).item())
+                weight = weight[:sent_scores.size(-1)]
+                # weight = torch.ones(self.args.max_src_nsents)
+                loss = F.nll_loss(
+                    F.log_softmax(
+                        sent_scores.view(-1, sent_scores.size(-1)),
+                        dim=-1,
+                        dtype=torch.float32,
+                    ),
+                    labels_id.view(-1),  # bsz sent
+                    weight=weight,
+                    reduction='sum',
+                    ignore_index=-1,
+                )
+                prediction = torch.argmax(sent_scores, dim=-1)
+                if (self.optim._step + 1) % self.args.print_every == 0:
+                    logger.info(
+                        'train prediction: %s |label %s ' % (str(prediction), str(labels_id)))
+                # both are numbers
+                accuracy = torch.div(torch.sum(torch.equal(prediction, labels_id).float()), tgt_len)
+            else:
+                sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+                loss = self.loss(sent_scores, labels.float())
+                loss = (loss * mask.float()).sum()
+                tgt_len = 3
+                _, labels_id = torch.topk(labels, k=tgt_len)  # B, tgt_len
+                labels_id, _ = torch.sort(labels_id)
+                _, prediction = torch.topk(sent_scores, k=tgt_len)
+                prediction, _ = torch.sort(labels_id)
+                if (self.optim._step + 1) % self.args.print_every == 0:
+                    logger.info(
+                        'train prediction: %s |label %s ' % (str(prediction), str(labels_id)))
+                accuracy = torch.div(torch.sum(torch.equal(prediction, labels_id).float()), tgt_len)
+            # (loss / loss.numel()).backward()
+            with amp.scale_loss((loss / loss.numel()), self.optim) as scaled_loss:
+                scaled_loss.backward()
             # loss.div(float(normalization)).backward()
-
-            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
+            if self.args.acc_reporter:
+                batch_stats = acc_reporter(float(loss.cpu().data.numpy()),accuracy, normalization)
+            else:
+                batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
 
             total_stats.update(batch_stats)
             report_stats.update(batch_stats)
@@ -386,7 +480,10 @@ class Trainer(object):
             stat: the updated (or unchanged) stat object
         """
         if stat is not None and self.n_gpu > 1:
-            return Statistics.all_gather_stats(stat)
+            if self.args.acc_reporter:
+                return acc_reporter.Statistics.all_gather_stats(stat)
+            else:
+                return Statistics.all_gather_stats(stat)
         return stat
 
     def _maybe_report_training(self, step, num_steps, learning_rate,

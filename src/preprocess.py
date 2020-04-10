@@ -6,6 +6,7 @@ import time
 
 from others.logging import init_logger
 from prepro import data_builder
+from jigsaw import jigsaw_data_builder
 
 
 def do_format_to_lines(args):
@@ -67,7 +68,16 @@ if __name__ == '__main__':
 
     parser.add_argument('-n_cpus', default=2, type=int)
 
-
+    # args for format to jigsaw
+    parser.add_argument('-times', default=3, type=int)
+    parser.add_argument('-unchange_prob', default=0.05, type=float)
+    parser.add_argument('-sample_near', default=0, type=int)
+    parser.add_argument('-keep_orgdata', default=0, type=int)
+    parser.add_argument('-max_pos', default=-1, type=int)
+    parser.add_argument('-shuffle_ratio', type=float, default=1.0)
     args = parser.parse_args()
     init_logger(args.log_file)
-    eval('data_builder.'+args.mode + '(args)')
+    if args.mode in ['format_to_jigsaw']: # multi-task 就share 底层的表示,比如文档的表示，之后我再看之前的paper
+        eval('jigsaw_data_builder.' + args.mode + '(args)')
+    else:
+        eval('data_builder.' + args.mode + '(args)')

@@ -227,7 +227,6 @@ class Statistics(object):
 
         """
         self.loss += stat.loss
-
         self.n_docs += stat.n_docs
 
     def xent(self):
