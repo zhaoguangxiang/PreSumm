@@ -21,8 +21,8 @@ from models.trainer_ext import build_trainer  # 这是trainer 是特殊的并没
 from others.logging import logger, init_logger
 from models.sentence_transformer import SentenceTransformer  # 23:03 3/31
 model_flags = ['hidden_size', 'ff_size', 'heads', 'inter_layers', 'encoder', 'ff_actv', 'use_interval', 'rnn_size']
-import apex.amp as amp
-from torch.nn.parallel import DistributedDataParallel
+# import apex.amp as amp
+# from torch.nn.parallel import DistributedDataParallel
 
 
 def train_multi_ext(args):
@@ -248,10 +248,10 @@ def train_single_ext(args, device_id):
     optim = model_builder.build_optim(args, model, checkpoint)
 
     logger.info(model)
-    if args.fp16:
-        opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
-    else:
-        opt_level = 'O0'  # pure fp32 traning
-    model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
+    # if args.fp16:
+    #     opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
+    # else:
+    #     opt_level = 'O0'  # pure fp32 traning
+    # model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
     trainer = build_trainer(args, device_id, model, optim)
     trainer.train(train_iter_fct, args.train_steps)

@@ -13,15 +13,16 @@ import time
 
 import torch
 import apex.amp as amp
-# import distributed
+from apex.parallel import DistributedDataParallel
+import distributed
 from jigsaw import jigsaw_data_loader
 from jigsaw.jigsaw_model import Jigsaw
-from jigsaw.jigsaw_trainer import build_trainer  # 这是trainer 是特殊的并没用原来的trainer
+from jigsaw.jigsaw_trainer_dis import build_trainer  # 这是trainer 是特殊的并没用原来的trainer
 from others.logging import logger, init_logger
 from models.model_builder import build_optim
 from models.sentence_transformer import SentenceTransformer
 # from torch.nn.parallel import DistributedDataParallel
-from apex.parallel import DistributedDataParallel
+# from apex.parallel import DistributedDataParallel
 model_flags = ['hidden_size', 'ff_size', 'heads', 'inter_layers', 'encoder', 'ff_actv', 'use_interval', 'rnn_size']
 
 
@@ -205,29 +206,43 @@ def test_jigsaw(args, device_id, pt, step):
 
 
 def train_jigsaw(args, device_id):
-    if (args.world_size > 1):
-        train_multi_jigsaw(args)
-    else:
-        train_single_jigsaw(args, device_id)
+    args.distributed = False
+    if 'WORLD_SIZE' in os.environ:
+        args.distributed = int(os.environ['WORLD_SIZE']) > 1
+
+    if args.distributed:
+        # FOR DISTRIBUTED:  Set the device according to local_rank.
+        torch.cuda.set_device(args.local_rank)
+
+        # FOR DISTRIBUTED:  Initialize the backend.  torch.distributed.launch will provide
+        # environment variables, and requires that you use init_method=`env://`.
+        torch.distributed.init_process_group(backend='nccl',
+                                             init_method='env://')
+    torch.backends.cudnn.benchmark = True
+    # if (args.world_size > 1):
+    #     train_multi_jigsaw(args)
+    # else:
+    train_single_jigsaw(args, device_id)
 
 
 def train_single_jigsaw(args, device_id):
     init_logger(args.log_file)
 
-    device = "cpu" if args.visible_gpus == '-1' else "cuda"
-    logger.info('Device ID %d' % device_id)
-    logger.info('Device %s' % device)
+    # device = "cpu" if args.visible_gpus == '-1' else "cuda"
+    device = 'cuda'
+    # logger.info('Device ID %d' % device_id)
+    # logger.info('Device %s' % device)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.deterministic = True
 
     if device_id >= 0:
-        torch.cuda.set_device(device_id)
+        # torch.cuda.set_device(device_id)
         torch.cuda.manual_seed(args.seed)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.deterministic = True
 
     if args.train_from != '':
         logger.info('Loading checkpoint from %s' % args.train_from)
@@ -256,6 +271,11 @@ def train_single_jigsaw(args, device_id):
     else:
         opt_level = 'O0'  # pure fp32 traning
     model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
+    if args.distributed:
+        # FOR DISTRIBUTED:  After amp.initialize, wrap the model with
+        # apex.parallel.DistributedDataParallel.
+        model = DistributedDataParallel(model)
+
     # logger.info('type(optim)'+str(type(optim)))
     trainer = build_trainer(args, device_id, model, optim)
     trainer.train(train_iter_fct, args.train_steps)

@@ -33,12 +33,12 @@ def build_trainer(args, device_id, model, optim):
     grad_accum_count = args.accum_count
     n_gpu = args.world_size
 
-    if device_id >= 0:
-        gpu_rank = int(args.gpu_ranks[device_id])
-    else:
-        gpu_rank = 0
-        n_gpu = 0
-
+    # if device_id >= 0:
+    #     gpu_rank = int(args.gpu_ranks[device_id])
+    # else:
+    #     gpu_rank = 0
+    #     n_gpu = 0
+    gpu_rank = args.local_rank
     print('gpu_rank %d' % gpu_rank)
 
     tensorboard_log_dir = args.model_path

@@ -12,7 +12,7 @@ import signal
 import time
 
 import torch
-import apex.amp as amp
+# import apex.amp as amp
 import distributed
 from jigsaw import jigsaw_data_loader
 from jigsaw.jigsaw_model import Jigsaw
@@ -251,11 +251,11 @@ def train_single_jigsaw(args, device_id):
     optim = build_optim(args, model, checkpoint)
 
     logger.info(model)
-    if args.fp16:
-        opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
-    else:
-        opt_level = 'O0'  # pure fp32 traning
-    model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
+    # if args.fp16:
+    #     opt_level = 'O1'  # typical fp16 training, can also try O2 to compare performance
+    # else:
+    #     opt_level = 'O0'  # pure fp32 traning
+    # model, optim.optimizer = amp.initialize(model, optim.optimizer, opt_level=opt_level)
     # logger.info('type(optim)'+str(type(optim)))
     trainer = build_trainer(args, device_id, model, optim)
     trainer.train(train_iter_fct, args.train_steps)

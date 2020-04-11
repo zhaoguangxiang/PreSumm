@@ -159,6 +159,8 @@ if __name__ == '__main__':
     parser.add_argument("-acc_reporter", default=0, type=int)
     parser.add_argument('-shuffle_ratio', type=float, default=1.0)
 
+    parser.add_argument("--local_rank", default=0, type=int)
+
     args = parser.parse_args()
     args.gpu_ranks = [int(i) for i in range(len(args.visible_gpus.split(',')))]
     args.world_size = len(args.gpu_ranks)

@@ -403,9 +403,9 @@ class Trainer(object):
                     logger.info(
                         'train prediction: %s |label %s ' % (str(prediction), str(labels_id)))
                 accuracy = torch.div(torch.sum(torch.equal(prediction, labels_id).float()), tgt_len)
-            # (loss / loss.numel()).backward()
-            with amp.scale_loss((loss / loss.numel()), self.optim.optimizer) as scaled_loss:
-                scaled_loss.backward()
+            (loss / loss.numel()).backward()
+            # with amp.scale_loss((loss / loss.numel()), self.optim.optimizer) as scaled_loss:
+            #     scaled_loss.backward()
             # loss.div(float(normalization)).backward()
             if self.args.acc_reporter:
                 batch_stats = acc_reporter(float(loss.cpu().data.numpy()),accuracy, normalization)
