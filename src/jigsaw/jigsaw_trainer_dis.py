@@ -3,12 +3,13 @@ import os
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
-
+import torch.nn.functional as F
+from jigsaw import acc_reporter
 import distributed
 from models.reporter_ext import ReportMgr, Statistics
 from others.logging import logger
 from others.utils import test_rouge, rouge_results_to_str
-
+import apex.amp as amp
 
 def _tally_parameters(model):
     n_params = sum([p.nelement() for p in model.parameters()])
@@ -43,8 +44,10 @@ def build_trainer(args, device_id, model, optim):
     tensorboard_log_dir = args.model_path
 
     writer = SummaryWriter(tensorboard_log_dir, comment="Unmt")
-
-    report_manager = ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
+    if args.acc_reporter:
+        report_manager = acc_reporter.ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
+    else:
+        report_manager = ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
 
     trainer = Trainer(args, model, optim, grad_accum_count, n_gpu, gpu_rank, report_manager)
 
@@ -120,15 +123,17 @@ class Trainer(object):
         """
         logger.info('Start training...')
 
-        # step =  self.optim._step + 1
         step = self.optim._step + 1
         true_batchs = []
         accum = 0
         normalization = 0
         train_iter = train_iter_fct()
-
-        total_stats = Statistics()
-        report_stats = Statistics()
+        if self.args.acc_reporter:
+            total_stats = acc_reporter.Statistics()
+            report_stats = acc_reporter.Statistics()
+        else:
+            total_stats = Statistics()
+            report_stats = Statistics()
         self._start_report_manager(start_time=total_stats.start_time)
 
         while step <= train_steps:
@@ -177,23 +182,79 @@ class Trainer(object):
         """
         # Set model in validating mode.
         self.model.eval()
-        stats = Statistics()
+        if self.args.acc_reporter:
+            stats = acc_reporter.Statistics()
+        else:
+            stats = Statistics()
 
         with torch.no_grad():
             for batch in valid_iter:
-                src = batch.src
-                labels = batch.src_sent_labels
-                segs = batch.segs
-                clss = batch.clss
-                mask = batch.mask_src
-                mask_cls = batch.mask_cls
+                # src = batch.src
+                # labels = batch.src_sent_labels
+                # segs = batch.segs
+                # clss = batch.clss
+                # mask = batch.mask_src
+                # mask_cls = batch.mask_cls
 
-                sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+                # sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+                if self.args.jigsaw == 'jigsaw_lab':  # jigsaw_lab 3.31 23:38 发现之前忘了改validate, 早上起来再跑一次看看
+                    logits = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s)
+                    # bsz, sent, max-sent_num
+                    # mask = batch.mask_cls_s[:, :, None].float()
+                    # loss = self.loss(sent_scores, batch.poss_s.float())
+                    loss = F.nll_loss(
+                        F.log_softmax(
+                            logits.view(-1, logits.size(-1)),
+                            dim=-1,
+                            dtype=torch.float32,
+                        ),
+                        batch.poss_s.view(-1),  # bsz sent
+                        reduction='sum',
+                        ignore_index=-1,
+                    )
+                    prediction = torch.argmax(logits, dim=-1)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                                         torch.sum(batch.mask_cls_s)) * len(logits)
+                elif self.args.jigsaw == 'jigsaw_dec':  # jigsaw decoder
+                    poss_s = batch.poss_s
+                    mask_poss = torch.eq(poss_s, -1)
+                    poss_s.masked_fill_(mask_poss, 1e4)
+                    # poss_s[i] [5,1,4,0,2,3,-1,-1]->[5,1,4,0,2,3,1e4,1e4]
+                    dec_labels = torch.argsort(poss_s, dim=1)  # dec_labels[i] [3,1,xxx,6,7]
+                    logits = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s,
+                                        dec_labels)
+                    final_dec_labels = dec_labels.masked_fill(mask_poss, -1)  # final_dec_labels[i] [3,1,xxx,-1,-1]
+                    loss = F.nll_loss(
+                        F.log_softmax(
+                            logits.view(-1, logits.size(-1)),
+                            dim=-1,
+                            dtype=torch.float32,
+                        ),
+                        final_dec_labels.view(-1),  # bsz sent
+                        reduction='sum',
+                        ignore_index=-1,
+                    )
 
-                loss = self.loss(sent_scores, labels.float())
-                loss = (loss * mask.float()).sum()
-                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                    # loss = (loss * batch.mask_cls_s.float()).sum()
+                    prediction = torch.argmax(logits, dim=-1)
+                    if (self.optim._step + 1) % self.args.print_every == 0:
+                        logger.info(
+                            'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                    accuracy = torch.div(torch.sum(torch.equal(prediction, batch.final_dec_labels) * batch.mask_cls_s),
+                                         torch.sum(batch.mask_cls_s)) * len(logits)
+
+
+                # loss = self.loss(sent_scores, labels.float())
+                # loss = (loss * mask.float()).sum()
+                if self.args.acc_reporter:
+                    batch_stats = acc_reporter.Statistics(float(loss.cpu().data.numpy()), accuracy, len(batch.poss_s))
+                else:
+                    batch_stats = Statistics(float(loss.cpu().data.numpy()), len(batch.poss_s))
                 stats.update(batch_stats)
+
             self._report_step(0, step, valid_stats=stats)
             return stats
 
@@ -301,22 +362,84 @@ class Trainer(object):
         for batch in true_batchs:
             if self.grad_accum_count == 1:
                 self.model.zero_grad()
+            # src = torch.tensor(self._pad(pre_src, 0))
+            # segs = torch.tensor(self._pad(pre_segs, 0))
+            # mask_src = torch.logical_not(src == 0)
+            # clss = torch.tensor(self._pad(pre_clss, -1))
+            # src_sent_labels = torch.tensor(self._pad(pre_src_sent_labels, 0))
+            # mask_cls = torch.logical_not(clss == -1)
+            # clss[clss == -1] = 0
+            # setattr(self, 'clss' + postfix, clss.to(device))
+            # setattr(self, 'mask_cls' + postfix, mask_cls.to(device))
+            # setattr(self, 'src_sent_labels' + postfix, src_sent_labels.to(device))
+            # setattr(self, 'src' + postfix, src.to(device))
+            # setattr(self, 'segs' + postfix, segs.to(device))
+            # setattr(self, 'mask_src' + postfix, mask_src.to(device))
+            # # 下面都是要预测的给他pad -1, 意思是看到-1 就停止算loss, 不用计算mask ,mask 是作为输入时才要的
+            # org_sent_labels = torch.tensor(self._pad(org_sent_labels, -1))
+            # setattr(self, 'org_sent_labels' + postfix, org_sent_labels.to(device))
+            # poss = torch.tensor(self._pad(poss, -1))
+            # setattr(self, 'poss' + postfix, poss.to(device))
 
-            src = batch.src
-            labels = batch.src_sent_labels
-            segs = batch.segs
-            clss = batch.clss
-            mask = batch.mask_src
-            mask_cls = batch.mask_cls
+            if self.args.jigsaw == 'jigsaw_lab':  # jigsaw_lab 各自预测的那种,失败的尝试
+                logits = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s)# bsz tgt_len nsent
+                # bsz, sent, max-sent_num
+                # mask = batch.mask_cls_s[:, :, None].float()
+                # loss = self.loss(sent_scores, batch.poss_s.float())
+                loss = F.nll_loss(
+                    F.log_softmax(
+                        logits.view(-1, logits.size(-1)),
+                        dim=-1,
+                        dtype=torch.float32,
+                    ),
+                    batch.poss_s.view(-1), # bsz sent
+                    reduction='sum',
+                    ignore_index=-1,
+                )
+                prediction = torch.argmax(logits, dim=-1)
+                if (self.optim._step + 1) % self.args.print_every == 0:
+                    logger.info(
+                        'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                                     torch.sum(batch.mask_cls_s)) * len(logits)
 
-            sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
-
-            loss = self.loss(sent_scores, labels.float())
-            loss = (loss * mask.float()).sum()
-            (loss / loss.numel()).backward()
+                # loss = (loss * batch.mask_cls_s.float()).sum()
+                # print('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
+                # logger.info('train prediction: %s |label %s ' % (str(torch.argmax(logits, dim=-1)[0]), str(batch.poss_s[0])))
+                # (loss / loss.numel()).backward()
+            else:  #self.args.jigsaw == 'jigsaw_dec':    jigsaw decoder
+                poss_s = batch.poss_s
+                mask_poss = torch.eq(poss_s, -1)
+                poss_s.masked_fill_(mask_poss, 1e4)
+                # poss_s[i] [5,1,4,0,2,3,-1,-1]->[5,1,4,0,2,3,1e4,1e4] dec_labels[i] [3,1,xxx,6,7]
+                dec_labels = torch.argsort(poss_s, dim=1)
+                logits,_ = self.model(batch.src_s, batch.segs_s, batch.clss_s, batch.mask_src_s, batch.mask_cls_s, dec_labels)
+                final_dec_labels = dec_labels.masked_fill(mask_poss, -1)
+                loss = F.nll_loss(
+                    F.log_softmax(
+                        logits.view(-1, logits.size(-1)),
+                        dim=-1,
+                        dtype=torch.float32,
+                    ),
+                    final_dec_labels.view(-1),  # bsz sent
+                    reduction='sum',
+                    ignore_index=-1,
+                )
+                # loss = (loss * batch.mask_cls_s.float()).sum()
+                # (loss / loss.numel()).backward()
+                prediction = torch.argmax(logits, dim=-1)
+                if (self.optim._step + 1) % self.args.print_every == 0:
+                    logger.info(
+                        'train prediction: %s |label %s ' % (str(prediction), str(batch.poss_s)))
+                accuracy = torch.div(torch.sum(torch.equal(prediction, batch.poss_s) * batch.mask_cls_s),
+                                     torch.sum(batch.mask_cls_s)) * len(logits)
+            with amp.scale_loss((loss / loss.numel()), self.optim.optimizer) as scaled_loss:
+                scaled_loss.backward()
             # loss.div(float(normalization)).backward()
-
-            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
+            if self.args.acc_reporter:
+                batch_stats = acc_reporter.Statistics(float(loss.cpu().data.numpy()), accuracy, normalization)
+            else:
+                batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
 
             total_stats.update(batch_stats)
             report_stats.update(batch_stats)
@@ -386,7 +509,10 @@ class Trainer(object):
             stat: the updated (or unchanged) stat object
         """
         if stat is not None and self.n_gpu > 1:
-            return Statistics.all_gather_stats(stat)
+            if self.args.acc_reporter:
+                return acc_reporter.Statistics.all_gather_stats(stat)
+            else:
+                return Statistics.all_gather_stats(stat)
         return stat
 
     def _maybe_report_training(self, step, num_steps, learning_rate,
