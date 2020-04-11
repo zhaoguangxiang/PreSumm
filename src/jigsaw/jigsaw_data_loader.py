@@ -6,6 +6,7 @@ import random
 import torch
 
 from others.logging import logger
+from jigsaw.tools import logical_not
 
 
 class Batch(object):
@@ -18,10 +19,10 @@ class Batch(object):
     def batch_pre(self, pre_src,pre_segs,pre_clss, pre_src_sent_labels, org_sent_labels, poss, device, postfix):
         src = torch.tensor(self._pad(pre_src, 0))
         segs = torch.tensor(self._pad(pre_segs, 0))
-        mask_src = torch.logical_not(src == 0)
+        mask_src = logical_not(src == 0)
         clss = torch.tensor(self._pad(pre_clss, -1))
         src_sent_labels = torch.tensor(self._pad(pre_src_sent_labels, 0))
-        mask_cls = torch.logical_not(clss == -1)
+        mask_cls = logical_not(clss == -1)
         clss[clss == -1] = 0
         setattr(self, 'clss' + postfix, clss.to(device))
         setattr(self, 'mask_cls' + postfix, mask_cls.to(device))
@@ -35,7 +36,7 @@ class Batch(object):
         poss = torch.tensor(self._pad(poss, -1))  # 和sent albels 不一样，不能用0pad, 因为0也是一个意义值，用-1合适
         setattr(self, 'poss' + postfix, poss.to(device))
 
-        assert torch.equal(torch.logical_not(poss == -1), mask_cls)  # 2020/3/30 18:18 如果这关过了就很开心了
+        assert torch.equal(logical_not(poss == -1), mask_cls)  # 2020/3/30 18:18 如果这关过了就很开心了
         # dec_poss = torch.tensor(self._pad(dec_poss, -1))
         # setattr(self, 'poss' + postfix, poss.to(device))
 
@@ -72,7 +73,7 @@ class Batch(object):
                                device=device,  postfix='')
             pre_tgt = [x[1] for x in data0]
             tgt = torch.tensor(self._pad(pre_tgt, 0))
-            mask_tgt = torch.logical_not(tgt == 0)
+            mask_tgt = logical_not(tgt == 0)
             setattr(self, 'tgt', tgt.to(device))
             setattr(self, 'mask_tgt', mask_tgt.to(device))
 

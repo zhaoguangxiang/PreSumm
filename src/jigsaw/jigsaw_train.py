@@ -21,7 +21,7 @@ from others.logging import logger, init_logger
 from models.model_builder import build_optim
 from models.sentence_transformer import SentenceTransformer
 # from torch.nn.parallel import DistributedDataParallel
-from apex.parallel import DistributedDataParallel
+# from apex.parallel import DistributedDataParallel
 model_flags = ['hidden_size', 'ff_size', 'heads', 'inter_layers', 'encoder', 'ff_actv', 'use_interval', 'rnn_size']
 
 
